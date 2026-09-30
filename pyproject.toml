@@ -205,6 +205,11 @@ environments = [
     "python_full_version != '3.13.*' or sys_platform != 'linux'",
 ]
 
+[tool.uv.workspace]
+members = [
+    "my-pipecat-app",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
