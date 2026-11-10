@@ -14,6 +14,10 @@ Documentation status: 2026-09-29.
     recording, analysis, and call lifecycle.
 -   `05_COMMAND_RUNBOOK.md` --- commands for setup, validation, running,
     testing, and troubleshooting.
+-   `06_PIPECAT_FULL_ANALYSIS.md` --- full analysis: framework, service
+    architecture, call lifecycle, automation/reminder status, findings.
+-   `07_TELEPHONIC_AUTO_CALLS.md` --- HRM Telephonic Auto Calls module:
+    auto-dial, questions, department notifications, reminders, integration.
 
 ## Current milestone
 

@@ -41,6 +41,9 @@ import db
 # interview_id -> runner, so POST /cancel can stop a live call.
 active_runners: dict[int, WorkerRunner] = {}
 
+# The event loop holds tasks weakly; keep analysis tasks alive until they finish.
+_analysis_tasks: set[asyncio.Task] = set()
+
 
 # ---------------------------------------------------------------------------
 # AI INTERVIEW SYSTEM PROMPT
@@ -135,9 +138,21 @@ async def end_interview(params: FunctionCallParams):
 # ---------------------------------------------------------------------------
 
 
-async def run_bot(transport: BaseTransport, handle_sigint: bool, interview: dict | None):
-    interview_id = interview["id"] if interview else None
+async def run_call(
+    transport: BaseTransport,
+    handle_sigint: bool,
+    context: LLMContext,
+    *,
+    label: str,
+    system_prompt: str,
+    registry: dict[int, WorkerRunner] | None = None,
+    key: int | None = None,
+) -> None:
+    """Run one phone conversation on `context` (which carries the tools) until it ends.
 
+    The agent greets as soon as the stream connects. `registry[key]` holds the runner
+    while the call is live so it can be cancelled from the API.
+    """
     # Ollama must be running locally. base_url is a constructor argument, not a
     # Settings field, in this Pipecat build. reasoning_effort=none disables Qwen
     # thinking: measured 43 s vs 0.5 s per reply on qwen3.5:9b.
@@ -145,7 +160,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool, interview: dict
         base_url=f"{config.OLLAMA_BASE_URL}/v1",
         settings=OLLamaLLMService.Settings(
             model=config.OLLAMA_MODEL,
-            system_instruction=build_system_prompt(interview),
+            system_instruction=system_prompt,
             extra={"reasoning_effort": "none"},
         ),
     )
@@ -156,20 +171,6 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool, interview: dict
         api_key=config.CARTESIA_API_KEY,
         settings=CartesiaTTSService.Settings(voice=config.CARTESIA_VOICE_ID),
     )
-
-    tools = ToolsSchema(
-        standard_tools=[
-            FunctionSchema(
-                name="end_interview",
-                description="End the phone call after the closing statement has been spoken.",
-                properties={},
-                required=[],
-                handler=end_interview,
-            )
-        ]
-    )
-
-    context = LLMContext(tools=tools)
 
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
@@ -203,8 +204,8 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool, interview: dict
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        logger.info(f"Candidate connected (interview {interview_id})")
-        # The candidate answered the phone: the interviewer speaks first.
+        logger.info(f"Candidate connected ({label})")
+        # The candidate answered the phone: the agent speaks first.
         context.add_message(
             {"role": "developer", "content": "The candidate has answered the call. Greet them and begin."}
         )
@@ -212,15 +213,39 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool, interview: dict
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        logger.info(f"Candidate disconnected (interview {interview_id})")
+        logger.info(f"Candidate disconnected ({label})")
         await runner.cancel()
 
-    if interview_id:
-        active_runners[interview_id] = runner
+    if registry is not None and key is not None:
+        registry[key] = runner
     try:
         await runner.run()
     finally:
-        active_runners.pop(interview_id, None)
+        if registry is not None:
+            registry.pop(key, None)
+
+
+async def run_bot(transport: BaseTransport, handle_sigint: bool, interview: dict | None):
+    interview_id = interview["id"] if interview else None
+    end_tool = FunctionSchema(
+        name="end_interview",
+        description="End the phone call after the closing statement has been spoken.",
+        properties={},
+        required=[],
+        handler=end_interview,
+    )
+    context = LLMContext(tools=ToolsSchema(standard_tools=[end_tool]))
+    try:
+        await run_call(
+            transport,
+            handle_sigint,
+            context,
+            label=f"interview {interview_id}",
+            system_prompt=build_system_prompt(interview),
+            registry=active_runners,
+            key=interview_id,
+        )
+    finally:
         if interview_id:
             await finalize(interview_id, context)
 
@@ -240,7 +265,9 @@ async def finalize(interview_id: int, context: LLMContext) -> None:
     logger.info(f"Interview {interview_id} finalized: {candidate_turns} candidate turns")
     if candidate_turns:
         # Detached so the WebSocket handler returns promptly; errors are stored on the row.
-        asyncio.create_task(analysis.analyze_interview(interview_id))
+        task = asyncio.create_task(analysis.analyze_interview(interview_id))
+        _analysis_tasks.add(task)
+        task.add_done_callback(_analysis_tasks.discard)
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +276,7 @@ async def finalize(interview_id: int, context: LLMContext) -> None:
 
 
 async def bot(runner_args: RunnerArguments):
-    """Main bot entry point. Links the Exotel stream to its HRM interview row."""
+    """Main bot entry point. Links the Exotel stream to its HRM interview or telephonic call row."""
 
     transport_params = {
         "exotel": lambda: FastAPIWebsocketParams(
@@ -266,7 +293,18 @@ async def bot(runner_args: RunnerArguments):
     call_sid = call.call_id if call else None
     phones = [p for p in (call.from_number, call.to_number) if p] if call else []
 
-    interview = await db.find_for_call(call_sid, phones)
+    import tele  # tele imports run_call from this module
+
+    # A telephonic (HRM follow-up) call matched by its SID wins over an interview's
+    # phone-number fallback; an unmatched stream is then tried as a telephonic call.
+    tele_call = await tele.find_for_call(call_sid, []) if call_sid else None
+    interview = None if tele_call else await db.find_for_call(call_sid, phones)
+    if not tele_call and not interview:
+        tele_call = await tele.find_for_call(call_sid, phones)
+    if tele_call:
+        await tele.run_tele_call(transport, runner_args.handle_sigint, tele_call, call_sid)
+        return
+
     if interview:
         fields = {"status": "in_progress", "started_at": db.utcnow()}
         if call_sid and interview.get("call_sid") != call_sid:

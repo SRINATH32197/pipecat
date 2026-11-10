@@ -18,6 +18,9 @@ Exotel opens bidirectional WebSocket  →  /ws  →  Pipecat bot
 Deepgram → Ollama Qwen 3.5 9B → Cartesia
     ↓
 transcript + analysis stored; Exotel status webhook stores recording/duration
+
+Telephonic auto calls (tele.py) reuse the same Exotel flow and /ws: HRM schedules them
+and calls POST /api/telephonic-calls/{id}/dial; the bot asks HR's chosen questions.
 """
 
 import hmac
@@ -295,7 +298,7 @@ async def exotel_webhook(request: Request, token: str = ""):
     logger.info(f"Exotel callback {call_sid}: {status}")
     row = await db.find_for_call(call_sid, []) if call_sid else None
     if not row:
-        return {"ok": True, "matched": False}
+        return await tele_webhook(call_sid, status, payload)
 
     fields: dict = {}
     if payload.get("RecordingUrl"):
@@ -319,6 +322,70 @@ async def exotel_webhook(request: Request, token: str = ""):
             {"status": "failed", "error": "Call ended without the voicebot stream connecting"},
             only_if_active=True,
             actor="exotel",
+        )
+    return {"ok": True, "matched": True}
+
+
+# ---------------------------------------------------------------------------
+# TELEPHONIC AUTO CALLS (HRM owns the row, the schedule and the notifications)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/telephonic-calls/{call_id}/dial", dependencies=[Depends(require_api_key)])
+async def dial_tele_call(call_id: int, request: Request):
+    """Dial a call HRM has already moved to `dialing`."""
+    import tele
+
+    call = await tele.get_call(call_id)
+    if not call:
+        raise HTTPException(404, "Call not found")
+    if call["status"] != "dialing":
+        raise HTTPException(409, f"Call is {call['status']}, not dialing")
+    phone = str(call.get("phone") or "").replace(" ", "").replace("-", "")
+    if not E164.match(phone):
+        await tele.set_status(call_id, "failed", error="Phone number is not E.164")
+        raise HTTPException(400, "phone must be E.164, e.g. +919876543210")
+    try:
+        call_sid = await make_exotel_call(request.app.state.session, phone)
+    except Exception as e:
+        logger.exception("Exotel dial-out failed (telephonic call)")
+        await tele.set_status(call_id, "failed", error=f"dial: {e}"[:1000])
+        raise HTTPException(502, "Could not start the call; see call error")
+    row = await tele.set_status(call_id, "ringing", call_sid=call_sid)
+    return {"call_id": call_id, "call_sid": call_sid, "status": row["status"] if row else "cancelled"}
+
+
+@app.post("/api/telephonic-calls/{call_id}/stop", dependencies=[Depends(require_api_key)])
+async def stop_tele_call(call_id: int):
+    """Hang up a live call. HRM has already set the row to cancelled."""
+    import tele
+
+    runner = tele.active_tele_runners.get(call_id)
+    if runner:
+        await runner.cancel()
+    return {"call_id": call_id, "stopped": bool(runner)}
+
+
+async def tele_webhook(call_sid: str | None, status: str, payload: dict) -> dict:
+    import tele
+
+    call = await tele.find_for_call(call_sid, []) if call_sid else None
+    if not call:
+        return {"ok": True, "matched": False}
+    fields: dict = {}
+    if payload.get("RecordingUrl"):
+        fields["recording_url"] = str(payload["RecordingUrl"])
+    duration = payload.get("ConversationDuration") or payload.get("Duration")
+    if str(duration or "").isdigit():
+        fields["duration_seconds"] = int(duration)
+    await tele.save_provider_result(call["id"], fields)
+
+    new_status = EXOTEL_STATUS_MAP.get(status)
+    if new_status:
+        await tele.set_status(call["id"], new_status)
+    elif status == "completed" and call["status"] in ("dialing", "ringing"):
+        await tele.set_status(
+            call["id"], "failed", error="Call ended without the voicebot stream connecting"
         )
     return {"ok": True, "matched": True}
 
